@@ -1,0 +1,216 @@
+// Data impact analysis.
+// Select Application Functions and/or Application Components that fail or change.
+// For a component, its assigned functions (and those of its sub-components and
+// sub-functions) are taken into account.
+// For every Data Object the producer-to-consumer paths come from the shared path
+// engine. A consumer is impacted when a path to it passes a selected function:
+//   Lost     = no remaining path to the consumer
+//   Degraded = another path that avoids the selected functions still exists
+// Requires the viewpoint data_flow_path_engine (data_flow_path_engine.script).
+//
+// MODE = "table"     -> presentation type Table.
+// MODE = "highlight" -> presentation type "View: Highlight view"; highlights the
+//                       selected functions, the hit flows and the impacted consumers.
+
+MODE = "table";
+
+PATH_ENGINE = "data_flow_path_engine";
+FUNCTION = "ArchiMate:ApplicationFunction";
+COMPONENT = "ArchiMate:ApplicationComponent";
+DATA_OBJECT = "ArchiMate:ApplicationDataObject";
+
+function ownerName(functionObject) {
+    names = "";
+
+    forall rel in functionObject.relationsTo("ArchiMate:AssignmentRelation") {
+        if (rel.from is COMPONENT) {
+            names = names.empty() ? rel.from.name() : names + ", " + rel.from.name();
+        }
+    }
+
+    return names.empty() ? "(none)" : names;
+}
+
+function roleOf(functionObject, producers, processors, consumers) {
+    if (producers.contains(functionObject)) {
+        return "producer";
+    }
+
+    if (processors.contains(functionObject)) {
+        return "processor";
+    }
+
+    if (consumers.contains(functionObject)) {
+        return "consumer";
+    }
+
+    return "router";
+}
+
+function addScope(element, byref scope) {
+    if (scope.contains(element)) {
+        return;
+    }
+
+    scope.add(element);
+
+    if (element is COMPONENT) {
+        forall rel in element.relationsFrom("ArchiMate:AssignmentRelation") {
+            if (rel.to is FUNCTION) {
+                addScope(rel.to, scope);
+            }
+        }
+    }
+
+    forall rel in element.relationsFrom("ArchiMate:CompositionRelation") {
+        if (rel.to is COMPONENT || rel.to is FUNCTION) {
+            addScope(rel.to, scope);
+        }
+    }
+}
+
+// ---- Selection ----
+scope = Set();
+
+if (selection.isList()) {
+    forall selected in selection {
+        if (selected is "Reference") {
+            selected = selected.to;
+        }
+
+        if (selected is FUNCTION || selected is COMPONENT) {
+            addScope(selected, scope);
+        }
+    }
+}
+
+if (scope.empty()) {
+    error "Select one or more Application Functions or Application Components and run the script again.";
+    stop;
+}
+
+if (MODE == "table") {
+    header "Data object", "Impacted consumer", "Consumer component", "Impact", "Caused by";
+}
+
+highlighted = Set();
+impactCount = 0;
+
+forall DATA_OBJECT dataObject in model {
+    // ---- Roles and paths from the shared engine ----
+    producers = Set();
+    processors = Set();
+    consumers = Set();
+    paths = List();
+    currentPath = List();
+    currentNumber = 0;
+    rows = query(PATH_ENGINE, dataObject);
+
+    if (!rows.isUndefined()) {
+        forall row in rows {
+            if (row[1] == "role") {
+                if (row[3] == "producer") {
+                    producers.add(row[2]);
+                } else if (row[3] == "processor") {
+                    processors.add(row[2]);
+                } else if (row[3] == "consumer") {
+                    consumers.add(row[2]);
+                }
+            } else if (row[1] == "path") {
+                if (row[2] != currentNumber) {
+                    if (!currentPath.empty()) {
+                        paths.add(currentPath);
+                    }
+
+                    currentPath = List();
+                    currentNumber = row[2];
+                }
+
+                currentPath.add(row[3]);
+            }
+        }
+    }
+
+    if (!currentPath.empty()) {
+        paths.add(currentPath);
+    }
+
+    forall consumer in consumers {
+        // A failing consumer is itself in scope; it is not reported as impacted.
+        if (scope.contains(consumer)) {
+            continue;
+        }
+
+        pathCount = 0;
+        hitCount = 0;
+        causes = List();
+
+        forall path in paths {
+            if (path[path.size()].to != consumer) {
+                continue;
+            }
+
+            pathCount = pathCount + 1;
+            hit = false;
+            stepFunctions = List();
+            stepFunctions.add(path[1].from);
+
+            forall flow in path {
+                stepFunctions.add(flow.to);
+            }
+
+            forall step in stepFunctions {
+                if (scope.contains(step)) {
+                    hit = true;
+                    cause = step.name() + " (" +
+                        roleOf(step, producers, processors, consumers) + ")";
+
+                    if (!causes.contains(cause)) {
+                        causes.add(cause);
+                    }
+                }
+            }
+
+            if (hit) {
+                hitCount = hitCount + 1;
+
+                forall flow in path {
+                    highlighted.add(flow);
+                }
+            }
+        }
+
+        if (hitCount == 0) {
+            continue;
+        }
+
+        impactCount = impactCount + 1;
+        impact = hitCount == pathCount ? "Lost" : "Degraded (alternative path exists)";
+        causeText = "";
+
+        forall cause in causes {
+            causeText = causeText.empty() ? cause : causeText + ", " + cause;
+        }
+
+        if (MODE == "table") {
+            output dataObject, consumer, ownerName(consumer), impact, causeText;
+        } else {
+            highlighted.add(consumer);
+            highlighted.add(dataObject);
+        }
+    }
+}
+
+if (MODE == "table") {
+    if (impactCount == 0) {
+        output "", "", "", "No downstream impact found", "";
+    }
+} else {
+    forall element in scope {
+        highlighted.add(element);
+    }
+
+    forall object in highlighted {
+        output object;
+    }
+}

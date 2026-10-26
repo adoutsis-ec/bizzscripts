@@ -1,0 +1,18 @@
+// Context menu enabler for manage_data_roles.script:
+// exactly one Data Object, optionally with Application Functions.
+dataObjects = 0;
+
+forall selected in selection {
+    if (selected is "Reference") {
+        selected = selected.to;
+    }
+
+    if (selected is "ArchiMate:ApplicationDataObject") {
+        dataObjects = dataObjects + 1;
+    } else if (!(selected is "ArchiMate:ApplicationFunction")) {
+        output false;
+        stop;
+    }
+}
+
+output dataObjects == 1;

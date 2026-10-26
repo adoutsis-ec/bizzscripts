@@ -1,0 +1,251 @@
+// Select one or more Application Functions in a view (optionally also one Data Object)
+// and run the script. It creates/selects a Data Object and adds Access relations
+// (Function -> Data Object) with an access type chosen per function.
+// All questions are asked first; the model is only changed after the last answer,
+// so cancelling at any point leaves the model untouched.
+
+ACCESS_TYPE_ATTR = "accessType";
+ACCESS_ENUM_TYPE = "AccessRelationType";
+DATA_OBJECT_TYPE = "ArchiMate:ApplicationDataObject";
+ACCESS_REL_TYPE = "ArchiMate:AccessRelation";
+
+// ---- Helper functions (defined once, before use) ----
+function findAccess(functionObject, dataObject) {
+    forall rel in functionObject.relations(ACCESS_REL_TYPE) {
+        if (rel.from == dataObject || rel.to == dataObject) {
+            return rel;
+        }
+    }
+
+    return undefined;
+}
+
+function refOnView(object, view) {
+    forall ref in object.references() {
+        if (ref.parent("AbstractView") == view) {
+            return ref;
+        }
+    }
+
+    return undefined;
+}
+
+// ---- 0. Read the selection ----
+functions = List();
+functionRefs = Index();
+dataObject = undefined;
+
+forall selected in selection {
+    selectedRef = undefined;
+    selectedObject = selected;
+
+    if (selected is "Reference") {
+        selectedRef = selected;
+        selectedObject = selected.to;
+    }
+
+    if (selectedObject is "ArchiMate:ApplicationFunction") {
+        if (!functions.contains(selectedObject)) {
+            functions.add(selectedObject);
+
+            if (!selectedRef.isUndefined()) {
+                functionRefs.add(selectedObject, selectedRef);
+            }
+        }
+    } else if (selectedObject is DATA_OBJECT_TYPE) {
+        dataObject = selectedObject;
+    }
+}
+
+if (functions.empty()) {
+    error "Select one or more Application Functions in the view and run the script again.";
+    stop;
+}
+
+// ---- 1. Choose an existing Data Object or the name of a new one ----
+newDataObjectName = undefined;
+
+if (dataObject.isUndefined()) {
+    answer = messageBox(
+        "Create a NEW Data Object?\n\nYes = create new\nNo = select an existing one",
+        "Access relations for " + functions.size().toString() + " function(s)",
+        "yesnocancel",
+        "information"
+    );
+
+    if (answer == "cancel") {
+        stop;
+    }
+
+    if (answer == "yes") {
+        newDataObjectName = ask("string", "Name of the new Data Object");
+
+        if (newDataObjectName.isUndefined() || newDataObjectName.trim().empty()) {
+            stop;
+        }
+
+        newDataObjectName = newDataObjectName.trim();
+    } else {
+        dataObject = ask(DATA_OBJECT_TYPE, "Select the Data Object");
+
+        if (dataObject.isUndefined()) {
+            stop;
+        }
+    }
+}
+
+dataObjectName = dataObject.isUndefined() ? newDataObjectName : dataObject.name();
+
+// ---- 2. Ask the access type per function (native enumeration dropdown) ----
+chosenTypes = Index();
+
+forall functionObject in functions {
+    existing = dataObject.isUndefined() ? undefined : findAccess(functionObject, dataObject);
+    title = "Access type: " + functionObject.name() + " -> " + dataObjectName;
+
+    if (existing.isUndefined()) {
+        chosen = ask(ACCESS_ENUM_TYPE, title);
+    } else {
+        chosen = ask(ACCESS_ENUM_TYPE, title, existing.attrValue(ACCESS_TYPE_ATTR));
+    }
+
+    if (chosen.isUndefined()) {
+        output "Cancelled, nothing changed.";
+        stop;
+    }
+
+    chosenTypes.add(functionObject, chosen);
+}
+
+// ---- 3. Apply: create the Data Object and the access relations ----
+if (dataObject.isUndefined()) {
+    container = undefined;
+
+    if (model.canAddNewObject(DATA_OBJECT_TYPE)) {
+        container = model;
+    } else {
+        functionFolder = functions[1].parent();
+
+        if (!functionFolder.isUndefined() && functionFolder.canAddNewObject(DATA_OBJECT_TYPE)) {
+            container = functionFolder;
+        }
+    }
+
+    if (container.isUndefined()) {
+        error "Could not find a place in the model to create the Data Object.";
+        stop;
+    }
+
+    dataObject = container.addNewObject(DATA_OBJECT_TYPE, newDataObjectName);
+    dataObjectIsNew = true;
+} else {
+    dataObjectIsNew = false;
+}
+
+relationOf = Index();
+statusOf = Index();
+
+forall functionObject in functions {
+    rel = findAccess(functionObject, dataObject);
+
+    if (rel.isUndefined()) {
+        if (!functionObject.canAddRelationTo(dataObject, ACCESS_REL_TYPE)) {
+            statusOf.add(functionObject, "not allowed by metamodel");
+            continue;
+        }
+
+        rel = functionObject.addRelationTo(dataObject, ACCESS_REL_TYPE);
+        statusOf.add(functionObject, "created");
+    } else {
+        statusOf.add(functionObject, "updated");
+    }
+
+    rel.setAttrValue(ACCESS_TYPE_ATTR, chosenTypes.valueFor(functionObject));
+    relationOf.add(functionObject, rel);
+
+    if (rel.attrValue(ACCESS_TYPE_ATTR).toString() !=
+        chosenTypes.valueFor(functionObject).toString()) {
+        warning "Access type of " + functionObject.name() + " could not be set.";
+    }
+}
+
+if (relationOf.empty() && dataObjectIsNew && dataObject.isValid()) {
+    dataObject.delete();
+    error "No access relation could be created for the selected functions.";
+    stop;
+}
+
+// ---- 4. Show the Data Object and the relations on the view ----
+viewStatus = Index();
+
+if (!functionRefs.empty()) {
+    view = functionRefs.valueFor(functionRefs.keys()[1]).parent("AbstractView");
+    dataObjectRef = view.isUndefined() ? undefined : refOnView(dataObject, view);
+
+    if (!view.isUndefined() && dataObjectRef.isUndefined() &&
+        view.canAddNewReference(dataObject)) {
+        maxRight = undefined;
+        minTop = undefined;
+
+        forall functionObject, ref in functionRefs {
+            right = ref.origin()[1] + ref.dimensions()[1];
+            top = ref.origin()[2];
+
+            if (maxRight.isUndefined() || right > maxRight) {
+                maxRight = right;
+            }
+
+            if (minTop.isUndefined() || top < minTop) {
+                minTop = top;
+            }
+        }
+
+        dataObjectRef = view.addNewReference(dataObject);
+        dataObjectRef.setOrigin(maxRight + 100, minTop);
+    }
+
+    if (!dataObjectRef.isUndefined()) {
+        forall functionObject, rel in relationOf {
+            if (!functionRefs.contains(functionObject)) {
+                continue;
+            }
+
+            // Placing both ends on a view may already have added the relation.
+            relRef = refOnView(rel, view);
+
+            if (relRef.isUndefined()) {
+                functionRef = functionRefs.valueFor(functionObject);
+                fromRef = rel.from == functionObject ? functionRef : dataObjectRef;
+                toRef = rel.from == functionObject ? dataObjectRef : functionRef;
+
+                if (view.canAddNewReference(rel, fromRef, toRef)) {
+                    relRef = view.addNewReference(rel, fromRef, toRef);
+                }
+            }
+
+            if (relRef.isUndefined()) {
+                viewStatus.add(functionObject, "could not draw");
+            } else if (!relRef.isVisible()) {
+                viewStatus.add(functionObject, "hidden (check view settings)");
+            } else {
+                viewStatus.add(functionObject, "shown");
+            }
+        }
+    }
+}
+
+// ---- 5. Report ----
+header "Function", "Data object", "Access type", "Status", "On view";
+
+forall functionObject in functions {
+    accessType = "";
+
+    if (relationOf.contains(functionObject)) {
+        accessType = relationOf.valueFor(functionObject).attrValue(ACCESS_TYPE_ATTR).toString();
+    }
+
+    onView = viewStatus.contains(functionObject) ? viewStatus.valueFor(functionObject) : "not on view";
+
+    output functionObject.name(), dataObject.name(), accessType,
+        statusOf.valueFor(functionObject), onView;
+}

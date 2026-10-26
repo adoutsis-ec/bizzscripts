@@ -1,0 +1,12 @@
+forall selected in selection {
+    if (selected is "Reference") {
+        selected = selected.to;
+    }
+
+    if (!(selected is "ArchiMate:FlowRelation")) {
+        output false;
+        stop;
+    }
+}
+
+output true;
