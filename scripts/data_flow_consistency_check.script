@@ -1,0 +1,231 @@
+// Data flow consistency check (report only, no changes).
+// For every Data Object (or only the selected ones) the expected flows come from
+// the shared path engine and are compared with the flows associated with the
+// Data Object, and modelling rules are checked. Rows starting with "Note:" are
+// information only and are not counted as issues.
+// Fix the association findings with data_flow_consistency_fix.script.
+// Requires the viewpoint data_flow_path_engine (data_flow_path_engine.script).
+// Output presentation type: Table.
+
+PATH_ENGINE = "data_flow_path_engine";
+DATA_OBJECT = "ArchiMate:ApplicationDataObject";
+
+// ---- Scope: selected Data Objects, otherwise all ----
+dataObjects = List();
+
+if (selection.isList()) {
+    forall selected in selection {
+        if (selected is "Reference") {
+            selected = selected.to;
+        }
+
+        if (selected is DATA_OBJECT && !dataObjects.contains(selected)) {
+            dataObjects.add(selected);
+        }
+    }
+}
+
+if (dataObjects.empty()) {
+    forall DATA_OBJECT candidate in model {
+        dataObjects.add(candidate);
+    }
+}
+
+header "Data object", "Result", "Element", "Detail";
+issueCount = 0;
+noteCount = 0;
+
+forall dataObject in dataObjects {
+    // ---- Roles, paths and hints from the shared engine ----
+    producers = Set();
+    processors = Set();
+    consumers = Set();
+    excluded = Set();
+    expected = Set();
+    reachedConsumers = Set();
+    functionsOnPath = Set();
+    hints = List();
+    lastFlow = undefined;
+    lastNumber = 0;
+    rows = query(PATH_ENGINE, dataObject);
+
+    if (!rows.isUndefined()) {
+        forall row in rows {
+            if (row[1] == "role") {
+                if (row[3] == "producer") {
+                    producers.add(row[2]);
+                } else if (row[3] == "processor") {
+                    processors.add(row[2]);
+                } else if (row[3] == "consumer") {
+                    consumers.add(row[2]);
+                } else if (row[3] == "excluded") {
+                    excluded.add(row[2]);
+                }
+            } else if (row[1] == "path") {
+                flow = row[3];
+                expected.add(flow);
+                functionsOnPath.add(flow.from);
+                functionsOnPath.add(flow.to);
+
+                // The last flow of each path ends in the consumer it reaches.
+                if (row[2] != lastNumber && !lastFlow.isUndefined()) {
+                    reachedConsumers.add(lastFlow.to);
+                }
+
+                lastNumber = row[2];
+                lastFlow = flow;
+            } else if (row[1] == "hint") {
+                hints.add(row);
+            }
+        }
+    }
+
+    if (!lastFlow.isUndefined()) {
+        reachedConsumers.add(lastFlow.to);
+    }
+
+    // ---- Flows currently associated with the Data Object ----
+    associated = Set();
+
+    forall association in dataObject.relations("ArchiMate:AssociationRelation") {
+        other = association.from == dataObject ? association.to : association.from;
+
+        if (other is "ArchiMate:FlowRelation") {
+            associated.add(other);
+        }
+    }
+
+    issuesBefore = issueCount;
+
+    // ---- Roles ----
+    if (producers.empty()) {
+        output dataObject, "No producer", "", "No function has write access";
+        issueCount = issueCount + 1;
+    }
+
+    if (producers.size() > 1) {
+        output dataObject, "Note: several producers", "", producers.size().toString() +
+            " functions have write access (allowed, e.g. redundancy); each is walked separately";
+        noteCount = noteCount + 1;
+    }
+
+    if (consumers.empty()) {
+        output dataObject, "No consumer", "", "No function has read access";
+        issueCount = issueCount + 1;
+    }
+
+    accessSeen = List();
+    accessReported = List();
+
+    forall access in dataObject.relations("ArchiMate:AccessRelation") {
+        functionObject = access.from == dataObject ? access.to : access.from;
+
+        if (accessSeen.contains(functionObject)) {
+            if (!accessReported.contains(functionObject)) {
+                accessReported.add(functionObject);
+                output dataObject, "Several access relations", functionObject,
+                    "More than one access relation to the Data Object; keep only one";
+                issueCount = issueCount + 1;
+            }
+        } else {
+            accessSeen.add(functionObject);
+        }
+    }
+
+    forall functionObject in excluded {
+        output dataObject, "Note: excluded function", functionObject,
+            "Access type none: no route passes this function";
+        noteCount = noteCount + 1;
+    }
+
+    forall hint in hints {
+        if (hint[2] == "producer downstream") {
+            output dataObject, "Producer downstream", hint[3],
+                "Reached by a flow path from producer " + hint[4].name() +
+                "; should it be read/write (processor)?";
+            issueCount = issueCount + 1;
+        }
+    }
+
+    // ---- Paths ----
+    forall consumer in consumers {
+        if (!reachedConsumers.contains(consumer) && !producers.empty()) {
+            detail = "No flow path from a producer reaches this consumer";
+
+            forall hint in hints {
+                if (hint[2] == "behind consumer" && hint[3] == consumer) {
+                    detail = "Reachable only through consumer " + hint[4].name() +
+                        "; should " + hint[4].name() + " be read/write (processor)?";
+                }
+            }
+
+            output dataObject, "Unreached consumer", consumer, detail;
+            issueCount = issueCount + 1;
+        }
+    }
+
+    forall processor in processors {
+        if (!functionsOnPath.contains(processor) && !producers.empty()) {
+            output dataObject, "Processor off path", processor,
+                "Read/write function is not on any producer-consumer path";
+            issueCount = issueCount + 1;
+        }
+    }
+
+    // Rule: at most one flow per direction between two functions.
+    parallelReported = Set();
+
+    forall flow in expected {
+        if (parallelReported.contains(flow)) {
+            continue;
+        }
+
+        sameDirection = 0;
+
+        forall sibling in flow.from.relationsFrom("ArchiMate:FlowRelation") {
+            if (sibling.to == flow.to) {
+                sameDirection = sameDirection + 1;
+                parallelReported.add(sibling);
+            }
+        }
+
+        if (sameDirection > 1) {
+            output dataObject, "Parallel flows", flow, sameDirection.toString() +
+                " flows " + flow.from.name() + " -> " + flow.to.name() +
+                "; the rule is at most one flow per direction";
+            issueCount = issueCount + 1;
+        }
+    }
+
+    forall hint in hints {
+        if (hint[2] == "ignored route") {
+            output dataObject, "Note: ignored route", hint[3],
+                "Longer route from " + hint[4].name() + " via " + hint[5] +
+                " not associated (shortest kept); is one of these a processor?";
+            noteCount = noteCount + 1;
+        }
+    }
+
+    // ---- Associations ----
+    forall flow in expected {
+        if (!associated.contains(flow)) {
+            output dataObject, "Missing association", flow,
+                flow.from.name() + " -> " + flow.to.name() + " is on the path but not associated";
+            issueCount = issueCount + 1;
+        }
+    }
+
+    forall flow in associated {
+        if (!expected.contains(flow)) {
+            output dataObject, "Extra association", flow,
+                flow.from.name() + " -> " + flow.to.name() + " is associated but not on any path";
+            issueCount = issueCount + 1;
+        }
+    }
+
+    if (issueCount == issuesBefore) {
+        output dataObject, "OK", "", expected.size().toString() + " flow(s) consistent";
+    }
+}
+
+output "Total", issueCount.toString() + " issue(s)", "", noteCount.toString() + " note(s)";

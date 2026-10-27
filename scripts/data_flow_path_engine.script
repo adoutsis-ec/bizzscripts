@@ -1,0 +1,330 @@
+// Data flow path engine - the single place where the flow path logic lives.
+//
+// Save this script as a viewpoint named exactly: data_flow_path_engine
+// It is not run directly; other scripts call it with
+//     rows = query("data_flow_path_engine", dataObject);
+// The calling script must have a variable named dataObject (an Application
+// Data Object); query forwards it under that name.
+//
+// Roles, from the access relations of the Data Object:
+//   write = producer, read/write = processor, read = consumer,
+//   none = excluded (the function does not carry this Data Object; use it to
+//   cut an unwanted route).
+// A path runs over Flow relations from a producer to the first consumer it meets.
+// It may pass functions without access to the Data Object (routers), but never an
+// excluded function, another producer or the same function twice.
+// Several producers are allowed (e.g. redundancy); each is walked separately.
+// The paths are selected per producer-consumer pair:
+//   - if a path to the consumer passes a processor, only paths through a
+//     processor are kept, and a path that bypasses a processor is dropped (its
+//     processors are a strict subset of those of another path to the same
+//     consumer). Alternative processors (Enrich A or Enrich B) are both kept.
+//     Among paths with the same processor set, only the shortest are kept,
+//     including ties.
+//   - otherwise only the shortest path(s) are kept.
+//
+// Output rows (returned to the caller as a list of lists):
+//   "role", <function>, "producer" | "processor" | "consumer" | "excluded"
+//   "path", <path number>, <flow>     one row per flow, in path order
+//   "hint", <kind>, <function>, <other function>, <text>   modelling hints:
+//       "producer downstream": <function> is a producer reached from producer
+//                              <other function> (should it be read/write?)
+//       "ignored route":       a longer route from producer <other function> to
+//                              consumer <function> via <text> was not kept
+//       "behind consumer":     unreached consumer <function> is reachable only
+//                              through consumer <other function>
+FUNCTION = "ArchiMate:ApplicationFunction";
+
+if (dataObject.isUndefined() || !(dataObject is "ArchiMate:ApplicationDataObject")) {
+    error "data_flow_path_engine: variable dataObject must be an Application Data Object.";
+    stop;
+}
+
+// ---- Roles ----
+producers = Set();
+processors = Set();
+consumers = Set();
+excluded = Set();
+
+forall access in dataObject.relations("ArchiMate:AccessRelation") {
+    functionObject = access.from == dataObject ? access.to : access.from;
+
+    if (!(functionObject is FUNCTION)) {
+        continue;
+    }
+
+    accessType = access.attrValue("accessType").toString();
+
+    if (accessType == "write") {
+        producers.add(functionObject);
+        output "role", functionObject, "producer";
+    } else if (accessType == "read/write") {
+        processors.add(functionObject);
+        output "role", functionObject, "processor";
+    } else if (accessType == "read") {
+        consumers.add(functionObject);
+        output "role", functionObject, "consumer";
+    } else {
+        excluded.add(functionObject);
+        output "role", functionObject, "excluded";
+    }
+}
+
+// ---- Paths: breadth-first walk with a work queue (no recursion) ----
+pathNumber = 0;
+reached = Set();
+hintKeys = List();
+
+forall producer in producers {
+    queueFunction = List();
+    queueVisited = List();
+    queuePath = List();
+
+    startVisited = List();
+    startVisited.add(producer);
+    queueFunction.add(producer);
+    queueVisited.add(startVisited);
+    queuePath.add(List());
+
+    // Breadth-first, so the paths are found in order of increasing length.
+    found = List();
+    head = 0;
+
+    while (head < queueFunction.size()) {
+        head = head + 1;
+        currentFunction = queueFunction[head];
+        visited = queueVisited[head];
+        currentPath = queuePath[head];
+
+        forall flow in currentFunction.relationsFrom("ArchiMate:FlowRelation") {
+            nextFunction = flow.to;
+            nextPath = List();
+
+            forall step in currentPath {
+                nextPath.add(step);
+            }
+
+            nextPath.add(flow);
+
+            if (consumers.contains(nextFunction)) {
+                found.add(nextPath);
+            } else if (producers.contains(nextFunction)) {
+                if (nextFunction != producer) {
+                    hintKey = "producer downstream|" + nextFunction.name() + "|" + producer.name();
+
+                    if (!hintKeys.contains(hintKey)) {
+                        hintKeys.add(hintKey);
+                        output "hint", "producer downstream", nextFunction, producer, "";
+                    }
+                }
+            } else if (nextFunction is FUNCTION &&
+                !excluded.contains(nextFunction) &&
+                !visited.contains(nextFunction)) {
+                nextVisited = List();
+
+                forall visitedFunction in visited {
+                    nextVisited.add(visitedFunction);
+                }
+
+                nextVisited.add(nextFunction);
+                queueFunction.add(nextFunction);
+                queueVisited.add(nextVisited);
+                queuePath.add(nextPath);
+            }
+        }
+    }
+
+    // ---- Selection per producer-consumer pair ----
+    // Processors passed by each path.
+    pathProcessors = List();
+
+    forall path in found {
+        passed = List();
+
+        forall flow in path {
+            if (processors.contains(flow.to)) {
+                passed.add(flow.to);
+            }
+        }
+
+        pathProcessors.add(passed);
+    }
+
+    // Per consumer: is any path through a processor, and the shortest length.
+    withProcessor = Set();
+    shortest = Index();
+    position = 0;
+
+    forall path in found {
+        position = position + 1;
+        target = path[path.size()].to;
+
+        if (!pathProcessors[position].empty()) {
+            withProcessor.add(target);
+        }
+
+        if (!shortest.contains(target)) {
+            shortest.add(target, path.size());
+        }
+    }
+
+    position = 0;
+
+    forall path in found {
+        position = position + 1;
+        target = path[path.size()].to;
+        keep = true;
+
+        if (withProcessor.contains(target)) {
+            // Keep paths through a processor, but drop a path that bypasses one:
+            // its processors are a strict subset of those of another path.
+            mine = pathProcessors[position];
+
+            if (mine.empty()) {
+                keep = false;
+            }
+
+            otherPosition = 0;
+
+            forall otherPath in found {
+                otherPosition = otherPosition + 1;
+
+                if (keep && otherPosition != position &&
+                    otherPath[otherPath.size()].to == target) {
+                    theirs = pathProcessors[otherPosition];
+
+                    if (theirs.size() >= mine.size()) {
+                        subset = true;
+
+                        forall passedFunction in mine {
+                            if (!theirs.contains(passedFunction)) {
+                                subset = false;
+                            }
+                        }
+
+                        if (subset && (theirs.size() > mine.size() ||
+                            otherPath.size() < path.size())) {
+                            keep = false;
+                        }
+                    }
+                }
+            }
+        } else {
+            keep = path.size() == shortest.valueFor(target);
+        }
+
+        // Report longer alternatives only when their processor set is identical
+        // to a shorter path's (not when a path bypasses a processor).
+        shorterEquivalent = false;
+        otherPosition = 0;
+
+        if (!keep) {
+            forall otherPath in found {
+                otherPosition = otherPosition + 1;
+
+                if (otherPath[otherPath.size()].to == target &&
+                    otherPath.size() < path.size() &&
+                    pathProcessors[otherPosition].size() == pathProcessors[position].size()) {
+                    sameProcessors = true;
+
+                    forall passedFunction in pathProcessors[position] {
+                        if (!pathProcessors[otherPosition].contains(passedFunction)) {
+                            sameProcessors = false;
+                        }
+                    }
+
+                    if (sameProcessors) {
+                        shorterEquivalent = true;
+                    }
+                }
+            }
+
+            if (shorterEquivalent) {
+                viaText = "";
+                stepNumber = 0;
+
+                forall flow in path {
+                    stepNumber = stepNumber + 1;
+
+                    if (stepNumber < path.size()) {
+                        viaText = viaText.empty() ? flow.to.name() : viaText + ", " + flow.to.name();
+                    }
+                }
+
+                hintKey = "ignored route|" + producer.name() + "|" + target.name() + "|" + viaText;
+
+                if (!hintKeys.contains(hintKey)) {
+                    hintKeys.add(hintKey);
+                    output "hint", "ignored route", target, producer, viaText;
+                }
+            }
+        }
+
+        if (keep) {
+            pathNumber = pathNumber + 1;
+            reached.add(target);
+
+            forall flow in path {
+                output "path", pathNumber, flow;
+            }
+        }
+    }
+}
+
+// ---- Hint: consumers reachable only through another consumer ----
+unreachedCount = 0;
+
+forall consumer in consumers {
+    if (!reached.contains(consumer)) {
+        unreachedCount = unreachedCount + 1;
+    }
+}
+
+if (unreachedCount > 0) {
+    forall producer in producers {
+        // walkVia holds the first consumer passed; the producer itself means none.
+        walkFunction = List();
+        walkVia = List();
+        seen = Set();
+        walkFunction.add(producer);
+        walkVia.add(producer);
+        seen.add(producer);
+        head = 0;
+
+        while (head < walkFunction.size()) {
+            head = head + 1;
+            currentFunction = walkFunction[head];
+            via = walkVia[head];
+
+            forall flow in currentFunction.relationsFrom("ArchiMate:FlowRelation") {
+                nextFunction = flow.to;
+
+                if (!(nextFunction is FUNCTION) || seen.contains(nextFunction) ||
+                    excluded.contains(nextFunction) || producers.contains(nextFunction)) {
+                    continue;
+                }
+
+                seen.add(nextFunction);
+
+                if (consumers.contains(nextFunction) && !reached.contains(nextFunction) &&
+                    via != producer) {
+                    hintKey = "behind consumer|" + nextFunction.name() + "|" + via.name();
+
+                    if (!hintKeys.contains(hintKey)) {
+                        hintKeys.add(hintKey);
+                        output "hint", "behind consumer", nextFunction, via, "";
+                    }
+                }
+
+                nextVia = via;
+
+                if (via == producer && consumers.contains(nextFunction)) {
+                    nextVia = nextFunction;
+                }
+
+                walkFunction.add(nextFunction);
+                walkVia.add(nextVia);
+            }
+        }
+    }
+}

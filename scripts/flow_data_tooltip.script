@@ -1,0 +1,31 @@
+// Tooltip view variant of flow_query_table.script.
+// Save as a viewpoint with output presentation type "View: Tooltip view" and activate it
+// on a view: hovering a Flow relation shows its associated Data Object(s).
+
+header "Associated data objects";
+
+forall "ArchiMate:FlowRelation" flow in model {
+    names = List();
+
+    forall association in flow.relations("ArchiMate:AssociationRelation") {
+        relatedObject = association.from == flow ? association.to : association.from;
+
+        if (relatedObject is "ArchiMate:ApplicationDataObject" &&
+            !names.contains(relatedObject.name())) {
+            names.add(relatedObject.name());
+        }
+    }
+
+    if (names.empty()) {
+        output flow, "No associated data object";
+        continue;
+    }
+
+    tooltip = "";
+
+    forall name in names.sorted() {
+        tooltip = tooltip.empty() ? name : tooltip + ", " + name;
+    }
+
+    output flow, tooltip;
+}
